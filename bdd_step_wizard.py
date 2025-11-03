@@ -73,7 +73,7 @@ Grounding examples:
 Step: {step}
 Return JSON list of valid class/method calls ONLY from helpers."""
                 try:
-                    model = genai.GenerativeModel("gemini-1.5-flash")
+                    model = genai.GenerativeModel("gemini-2.5-flash")
                     resp = model.generate_content(prompt)
                     suggestion = json.loads(resp.text)
                     st.write("💡 LLM Suggestion:")
