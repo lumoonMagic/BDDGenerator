@@ -1,0 +1,592 @@
+from models.utility import Utility
+
+
+class Rubrik:
+
+    def __init__(self):
+        self.current_working_directory = os.getcwd()
+        self.config_file_path = os.path.join(self.current_working_directory, "config")
+        self.config_file = os.path.join(self.config_file_path, "main_config.ini")
+        self.config = configparser.ConfigParser()
+        self.config.read(self.config_file)
+
+        if not os.path.exists(self.config_file):
+            raise FileNotFoundError(f"Config file not found: {self.config_file}")
+
+        self.graph_url = self.config["rubrik"]["graph_url"]
+        self.oracle_sla_id = self.config["rubrik"]["oracle_sla_id"]
+
+    def create_token(self):
+        token_url = self.config["rubrik"]["token_url"]
+        client_id = self.config["rubrik"]["client_id"]
+        client_secret = Utility.decode(self.config["rubrik"]["client_secret"])
+        payload = json.dumps({
+            "client_id": client_id,
+            "client_secret": client_secret
+        })
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        response = requests.post(url=token_url, headers=headers, data=payload, verify=False)
+        if response.status_code == 200:
+            token = response.json()["access_token"]
+            return token
+        else:
+            msg = f"Failed to create Rubrik authentication token.\n" \
+                  f"API response status code :- {response.status_code}\n" \
+                  f"API response :- {response.text}"
+            raise Exception(msg)
+
+    def _load_json_payload(self, json_filename: str) -> dict:
+        file_path = Path(self.current_working_directory) / "data" / json_filename
+        try:
+            with file_path.open("r", encoding="utf-8") as file:
+                return json.load(file)
+        except FileNotFoundError:
+            raise FileNotFoundError(f"File {json_filename} does not exist in 'data' folder")
+
+    def get_oracle_db_id(self, db_name: str) -> dict:
+        oracle_db_id_query_file = self.config["rubrik"]["get_database_id_json"]
+        payload = self._load_json_payload(oracle_db_id_query_file)
+        payload["variables"]["name"] = db_name
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.create_token()}"
+        }
+        payload_str = json.dumps(payload)
+        print(f"To backup Oracle cluster calling POST API :- {self.graph_url}\nData :- {payload_str}")
+        response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+        msg = {"response": response.json()}
+        if response.status_code in [200, 201, 202]:
+            error = response.json().get("errors", [])
+            if error:
+                msg.update({"status": "Failed to get DB ID"})
+                msg.update({"response": error})
+            else:
+                msg.update({"status": "Successfully fetched DB ID"})
+        else:
+            msg.update({"status": "Failed to get DB ID"})
+            raise Exception(msg)
+        return msg
+
+    def list_oracle_dbs_by_host(self, hostname: str) -> dict:
+        """
+        List all Oracle databases for a given host.
+        Args:
+            hostname (str): The hostname to filter Oracle databases.
+        Returns:
+            dict: The response from the Rubrik API containing Oracle databases for the host.
+        """
+        query_file = self.config["rubrik"]["list_all_oracle_hosts_query"]
+        payload = self._load_json_payload(query_file)
+        # Update the hostFilter.texts with the provided hostname
+        payload['variables']['filter'][0]['texts'] = [hostname]
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.create_token()}"
+        }
+        payload_str = json.dumps(payload)
+        print(f"Querying Oracle DBs for host: {hostname} with payload {payload}")
+        response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+        if response.status_code == 200:
+            return response.json()
+        else:
+            msg = f"Failed to list Oracle DBs for host {hostname}. Status: {response.status_code}, Response: {response.text}"
+            print(msg)
+            raise Exception(msg)
+
+    def get_db_id_by_hostname(self, hostname):
+
+        data = self.list_oracle_dbs_by_host(hostname)
+        final_output = {}
+
+        try:
+            hosts = data['data']['oracleTopLevelDescendants']['edges']
+        except KeyError as e:
+            print(f"Error: Could not find expected key '{e}' in JSON data. Please check the response structure.")
+            return final_output
+
+        for host_edge in hosts:
+            host_node = host_edge.get('node', {})
+            if not host_node:
+                continue
+
+            # --- Extract Host-Level Information ---
+            physical_host_info = host_node.get('host', {})
+            cluster_info = host_node.get('cluster', {})
+            connection_info = host_node.get('connectionStatus', {})
+            sla_info = host_node.get('effectiveSlaDomain', {})
+            user_details = physical_host_info.get('oracleUserDetails', {})
+
+            fqdn = physical_host_info.get('name', host_node.get('name', 'unknown_host')).lower()
+
+            # --- NEW: Extract Database Information ---
+            databases = host_node.get('databaseDescendantConnection', {}).get('edges', [])
+            db_count = len(databases)
+            parsed_databases = []
+
+            for db_edge in databases:
+                db_node = db_edge.get('node', {})
+                if not db_node:
+                    continue
+
+                db_sla_domain = db_node.get('effectiveSlaDomain', {})
+                db_info = {
+                    "DB_Name": db_node.get('name', 'N/A'),
+                    "DB_FID": db_node.get('id', 'N/A'),
+                    "SLA_ID": db_sla_domain.get('id', 'N/A'),
+                    "SLA_Name": db_sla_domain.get('name', 'N/A'),
+                    "isRelic": db_node.get('IS_RELIC', 'N/A')
+                }
+                parsed_databases.append(db_info)
+
+            # --- Build the final dictionary for this host ---
+            host_details = {
+                "ClusterID": cluster_info.get('id', 'N/A'),
+                "ClusterName": cluster_info.get('name', 'N/A'),
+                "ClusterStatus": cluster_info.get('status', 'N/A'),
+                "IP_Addresses": physical_host_info.get('ipAddresses', []),
+                "OS_Name": physical_host_info.get('osName', 'N/A'),
+                "OS_Type": physical_host_info.get('osType', 'N/A'),
+                "OracleHostFID": host_node.get('id', 'N/A'),
+                "OracleHostName": host_node.get('name', 'N/A'),
+                "OracleHostStatus": connection_info.get('connectivity', 'N/A'),
+                "OracleSysDBAUser": user_details.get('sysDbaUser', 'N/A'),
+                "PhysicalHostFID": physical_host_info.get('id', 'N/A'),
+                "PhysicalHostName": physical_host_info.get('name', 'N/A'),
+                "SLA_ID": sla_info.get('id', 'N/A'),
+                "SLA_Name": sla_info.get('name', 'N/A'),
+                "DatabaseCount": db_count,
+                "Databases": parsed_databases
+            }
+
+            final_output[fqdn] = host_details
+
+        return final_output
+
+    def oracle_database_refresh(self, host_id: str) -> dict:
+        oracle_db_id_query_file = self.config["rubrik"]["refresh_database_json"]
+        payload = self._load_json_payload(oracle_db_id_query_file)
+        payload["variables"]["input"]["ids"] = host_id
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.create_token()}"
+        }
+        payload_str = json.dumps(payload)
+        print(f"To backup Oracle cluster calling POST API :- {self.graph_url}\nData :- {payload_str}")
+        response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+        msg = {"response": response.json()}
+        if response.status_code in [200, 201, 202]:
+            error = response.json().get("errors", [])
+            if error:
+                msg.update({"status": "Failed to refresh DB"})
+            else:
+                msg.update({"status": "Oracle database refresh succeeded."})
+        else:
+            raise Exception(msg)
+        return msg
+
+
+    def oracle_backup(self, database_id: str, sla_id: str) -> dict:
+        oracle_backup_query_file = self.config["rubrik"]["get_backup_json"]
+        payload = self._load_json_payload(oracle_backup_query_file)
+        payload["variables"]["input"]["id"] = database_id
+        payload["variables"]["input"]["config"]["baseOnDemandSnapshotConfig"]["slaId"] = sla_id
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.create_token()}"
+        }
+        payload_str = json.dumps(payload)
+        print(f"To backup Oracle cluster calling POST API :- {self.graph_url}\nData :- {payload_str}")
+        response = requests.post(url=self.graph_url, headers=headers, data=payload_str,verify=False)
+        msg = {"response": response.text}
+        if response.status_code in [200, 201, 202]:
+            error = response.json().get("errors", [])
+            if error:
+                msg.update({"status": "Backup failed"})
+                msg.update({"response": error})
+            else:
+                msg.update({"status": "Backup triggered"})
+        else:
+            msg.update({"status": "Backup failed"})
+            raise Exception(msg)
+        return msg
+
+    def oracle_archive_log_backup(self, database_id: str) -> dict:
+        oracle_archive_log_backup_query_file = self.config["rubrik"]["get_archive_log_backup_json"]
+        payload = self._load_json_payload(oracle_archive_log_backup_query_file)
+        payload["variables"]["input"]["id"] = database_id
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.create_token()}"
+        }
+        payload_str = json.dumps(payload)
+        print(f"To backup Oracle cluster calling POST API :- {self.graph_url}\nData :- {payload_str}")
+        response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+        msg = {"response": response.text}
+        if response.status_code in [200, 201, 202]:
+            error = response.json().get("errors", [])
+            if error:
+                msg.update({"status": "Backup failed"})
+                msg.update({"response": error})
+            else:
+                msg.update({"status": "Backup triggered"})
+        else:
+            msg.update({"status": "Backup failed"})
+            raise Exception(msg)
+        return msg
+
+    def oracle_restore(self, database_id: str,target_host_id: str, snapshot_id: str) -> dict:
+        oracle_db_restore_file = self.config["rubrik"]["get_restore_json"]
+        payload = self._load_json_payload(oracle_db_restore_file)
+
+        payload["variables"]["input"]["request"]["id"] = database_id
+        payload["variables"]["input"]["request"]["config"]["targetOracleHostOrRacId"] = target_host_id
+        payload["variables"]["input"]["request"]["config"]["recoveryPoint"]["snapshotId"] = snapshot_id
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.create_token()}"
+        }
+
+        payload_str = json.dumps(payload)
+        print(f"To restore Oracle DB calling POST API :- {self.graph_url}\nData :- {payload_str}")
+
+        response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+
+        msg = {"response": response.text}
+        if response.status_code in [200, 201, 202]:
+            error = response.json().get("errors", [])
+            if error:
+                msg.update({"status": "Restore failed"})
+                msg.update({"response": error})
+            else:
+                msg.update({"status": "Restore triggered"})
+        else:
+            msg.update({"status": "Restore failed"})
+            raise Exception(msg)
+
+        return msg
+
+    def oracle_archive_log_restore(self, database_id: str, target_host_id: str, target_mount_path: str, start_time: str,
+                                   end_time: str, ) -> dict:
+        oracle_log_restore_file = self.config["rubrik"]["oracle_log_restore_json"]
+        payload = self._load_json_payload(oracle_log_restore_file)
+
+        payload["variables"]["input"]["id"] = database_id
+        payload["variables"]["input"]["config"]["targetOracleHostOrRacId"] = target_host_id
+        payload["variables"]["input"]["config"]["targetMountPath"] = target_mount_path
+        payload["variables"]["input"]["config"]["oracleLogRecoveryRange"]["oracleTimeRange"]["startTime"] = start_time
+        payload["variables"]["input"]["config"]["oracleLogRecoveryRange"]["oracleTimeRange"]["endTime"] = end_time
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.create_token()}"
+        }
+
+        payload_str = json.dumps(payload)
+        print(f"To restore Oracle Archive Logs calling POST API :- {self.graph_url}\nData :- {payload_str}")
+
+        response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+
+        msg = {"response": response.text}
+        if response.status_code in [200, 201, 202]:
+            error = response.json().get("errors", [])
+            if error:
+                msg.update({"status": "Restore failed"})
+                msg.update({"response": error})
+            else:
+                msg.update({"status": "Restore triggered"})
+        else:
+            msg.update({"status": "Restore failed"})
+            raise Exception(msg)
+
+        return msg
+
+    def get_recent_event(self, database_id: str, activity_type: str) -> dict:
+        recent_events_json = self.config["rubrik"]["get_recent_events"]
+        payload = self._load_json_payload(recent_events_json)
+        payload["variables"]["filters"]["objectFid"] = database_id
+        payload["variables"]["filters"]["lastActivityType"] = activity_type
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.create_token()}"
+        }
+        payload = json.dumps(payload)
+        response = requests.post(url=self.graph_url, headers=headers, data=payload, verify=False)
+        msg = {"response": response.text}
+        if response.status_code in [200, 201, 202]:
+            error = response.json().get("errors", [])
+            if error:
+                msg.update({"script_status": "failed to get recent events"})
+                msg.update({"response": error})
+            else:
+                msg.update({"script_status": "Successfully fetched recent events"})
+        else:
+            msg.update({"status": "failed to get recent events"})
+            raise Exception(msg)
+        return msg
+
+    def get_activity_status(self, database_id: str, activity_type: str, max_wait=360):
+        elapsed = 0
+        poll_interval = 30
+
+        while elapsed < max_wait:
+            result = self.get_recent_event(database_id, activity_type)
+            response_data = json.loads(result['response'])
+            try:
+                node = response_data['data']['activitySeriesConnection']['edges'][0]['node']
+                status = node['lastActivityStatus']
+                print(f"Current status is :- {status}")
+                if status.lower() == 'failed' or status.lower() == 'failure':
+                    print(f"{activity_type} failed.")
+                    return status, node
+                if status.lower() == 'success':
+                    print(f"{activity_type.lower()} successful")
+                    return status, node
+
+            except (KeyError, IndexError):
+                print(f"No {activity_type} event found yet.")
+
+            time.sleep(poll_interval)
+            elapsed += poll_interval
+
+        raise TimeoutError(f"{activity_type} did not complete within the maximum wait time.")
+
+    # def get_oracle_snapshot_id(self, oracle_database_id: str, start_time_range: str, end_time_range: str) -> dict:
+    #     oracle_snapshot_json = self.config["rubrik"]["get_snapshot_id_json"]
+    #     payload = self._load_json_payload(oracle_snapshot_json)
+    #
+    #     variables = payload["variables"]
+    #     variables["snappableFid"] = oracle_database_id
+    #     variables["snappableId"] = oracle_database_id
+    #     variables["timeRange"]["start"] = start_time_range
+    #     variables["timeRange"]["end"] = end_time_range
+    #     variables["timeRangeStart"] = start_time_range
+    #     variables["timeRangeEnd"] = end_time_range
+    #     variables["isLegalHoldThroughRbacEnabled"] = True
+    #
+    #     headers = {
+    #         "Content-Type": "application/json",
+    #         "Authorization": f"Bearer {self.create_token()}"
+    #     }
+    #
+    #     payload_str = json.dumps(payload)
+    #     print(f"To get Oracle Snapshot ID calling POST API :- {self.graph_url}\nData :- {payload_str}")
+    #
+    #     response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+    #
+    #     if response.status_code in [200, 201, 202]:
+    #         error = response.json().get("errors", [])
+    #         if error:
+    #             msg = f"Failed to get Oracle Snapshot ID for database ID {oracle_database_id}"
+    #             msg += f"\nResponse :- {error}"
+    #             raise Exception(msg)
+    #         else:
+    #             db_snapshot_details = response.json()
+    #             return db_snapshot_details
+    #     else:
+    #         msg = f"Failed to get Oracle Snapshot ID for database ID {oracle_database_id}\n" \
+    #               f"Response status code :- {response.status_code}\n" \
+    #               f"Response :- {response.text}"
+    #         raise Exception(msg)
+
+    def get_latest_oracle_snapshot_id(self, database_id) -> str:
+        oracle_snapshot_json = self.config["rubrik"]["get_snapshot_id_json"]
+        payload = self._load_json_payload(oracle_snapshot_json)
+        payload["variables"]["snappableId"] = database_id
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.create_token()}"
+        }
+
+        payload_str = json.dumps(payload)
+        print(f"To get Oracle Snapshot ID calling POST API :- {self.graph_url}\nData :- {payload_str}")
+
+        response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+
+        if response.status_code in [200, 201, 202]:
+            error = response.json().get("errors", [])
+            if error:
+                msg = f"Failed to get Oracle Snapshot ID "
+                msg += f"\nResponse :- {error}"
+                raise Exception(msg)
+            else:
+                db_snapshot_details = response.json()
+                print(f"snapshot response:{db_snapshot_details}")
+                snapshot_id = db_snapshot_details['data']['snapshotsListConnection']['edges'][0]['node']['id']
+                return snapshot_id
+        else:
+            msg = f"Failed to get Oracle Snapshot ID \n" \
+                  f"Response status code :- {response.status_code}\n" \
+                  f"Response :- {response.text}"
+            raise Exception(msg)
+
+    # def get_oracle_host_id(self) -> dict[str, str]:
+    #     oracle_host_query_json = self.config["rubrik"]["get_oracle_host"]
+    #     payload = self._load_json_payload(oracle_host_query_json)
+    #
+    #     headers = {
+    #         "Content-Type": "application/json",
+    #         "Authorization": f"Bearer {self.create_token()}"
+    #     }
+    #
+    #     payload_str = json.dumps(payload)
+    #     print(f"Calling POST API to get Oracle host ID:\n{payload_str}")
+    #
+    #     # Send the POST request to the GraphQL endpoint
+    #     response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+    #
+    #     # Check for successful response
+    #     msg = {"response": response.text}
+    #     if response.status_code in [200, 201, 202]:
+    #         error = response.json().get("errors", [])
+    #         if error:
+    #             msg.update({"status": "Fetch failed"})
+    #             msg.update({"response": error})
+    #         else:
+    #             msg.update({"status": "Fetch successful"})
+    #     else:
+    #         msg.update({"status": "Fetch failed"})
+    #         raise Exception(msg)
+    #
+    #     return msg
+
+    # def list_oracle_dbs_by_host(self, hostname: str) -> dict:
+    #     """
+    #     List all Oracle databases for a given host.
+    #     Args:
+    #         hostname (str): The hostname to filter Oracle databases.
+    #     Returns:
+    #         dict: The response from the Rubrik API containing Oracle databases for the host.
+    #     """
+    #     query_file = self.config["rubrik"]["get_oracle_host"]
+    #     payload = self._load_json_payload(query_file)
+    #     # Update the hostFilter.texts with the provided hostname
+    #     payload['variables']['filter'][0]['texts'] = [hostname]
+    #     headers = {
+    #         "Content-Type": "application/json",
+    #         "Authorization": f"Bearer {self.create_token()}"
+    #     }
+    #     payload_str = json.dumps(payload)
+    #     print(f"Querying Oracle DBs for host: {hostname} with payload {payload}")
+    #     response = requests.post(url=self.graph_url, headers=headers, data=payload_str, verify=False)
+    #     if response.status_code == 200:
+    #         return response.json()
+    #     else:
+    #         msg = f"Failed to list Oracle DBs for host {hostname}. Status: {response.status_code}, Response: {response.text}"
+    #         print(msg)
+    #         raise Exception(msg)
+
+    def get_oracle_host_id(self, hostname):
+
+        oracle_host_fid = None
+        data = self.list_oracle_dbs_by_host(hostname)
+        final_output = {}
+
+        try:
+            hosts = data['data']['oracleTopLevelDescendants']['edges']
+        except KeyError as e:
+            print(f"Error: Could not find expected key '{e}' in JSON data. Please check the response structure.")
+            return final_output
+
+        for host_edge in hosts:
+            host_node = host_edge.get('node', {})
+            if not host_node:
+                continue
+
+            # --- Extract Host-Level Information ---
+            physical_host_info = host_node.get('host', {})
+            cluster_info = host_node.get('cluster', {})
+            connection_info = host_node.get('connectionStatus', {})
+            sla_info = host_node.get('effectiveSlaDomain', {})
+            user_details = physical_host_info.get('oracleUserDetails', {})
+
+            fqdn = physical_host_info.get('name', host_node.get('name', 'unknown_host')).lower()
+
+            # --- NEW: Extract Database Information ---
+            databases = host_node.get('databaseDescendantConnection', {}).get('edges', [])
+            db_count = len(databases)
+            parsed_databases = []
+
+            for db_edge in databases:
+                db_node = db_edge.get('node', {})
+                if not db_node:
+                    continue
+
+                db_sla_domain = db_node.get('effectiveSlaDomain', {})
+                db_info = {
+                    "DB_Name": db_node.get('name', 'N/A'),
+                    "DB_FID": db_node.get('id', 'N/A'),
+                    "SLA_ID": db_sla_domain.get('id', 'N/A'),
+                    "SLA_Name": db_sla_domain.get('name', 'N/A')
+                }
+                parsed_databases.append(db_info)
+
+            # --- Build the final dictionary for this host ---
+            host_details = {
+                "ClusterID": cluster_info.get('id', 'N/A'),
+                "ClusterName": cluster_info.get('name', 'N/A'),
+                "ClusterStatus": cluster_info.get('status', 'N/A'),
+                "IP_Addresses": physical_host_info.get('ipAddresses', []),
+                "OS_Name": physical_host_info.get('osName', 'N/A'),
+                "OS_Type": physical_host_info.get('osType', 'N/A'),
+                "OracleHostFID": host_node.get('id', 'N/A'),
+                "OracleHostName": host_node.get('name', 'N/A'),
+                "OracleHostStatus": connection_info.get('connectivity', 'N/A'),
+                "OracleSysDBAUser": user_details.get('sysDbaUser', 'N/A'),
+                "PhysicalHostFID": physical_host_info.get('id', 'N/A'),
+                "PhysicalHostName": physical_host_info.get('name', 'N/A'),
+                "SLA_ID": sla_info.get('id', 'N/A'),
+                "SLA_Name": sla_info.get('name', 'N/A'),
+                "DatabaseCount": db_count,
+                "Databases": parsed_databases
+            }
+
+            final_output[fqdn] = host_details
+            top_level_key = next(iter(final_output))
+            oracle_host_fid = final_output[top_level_key]['OracleHostFID']
+            # print(f"OracleHostFID new: {oracle_host_fid}")
+
+        return oracle_host_fid
+
+    def wait_until_database_is_relic(self, host_name, database_name, poll_interval=20, timeout=180):
+
+        start_time = time.time()
+
+        while True:
+            try:
+                # Fetch current DB info under the host
+                output = self.get_db_id_by_hostname(host_name)
+
+                # Extract databases list
+                host_data = output.get(host_name, {})
+                databases = host_data.get("Databases", [])
+
+                # Check if target database is still present
+                db_present = any(db.get("DB_Name") == database_name for db in databases)
+
+                if not db_present:
+                    msg = f"Database '{database_name}' is now a relic (no longer listed under IS_RELIC=false)."
+                    print(msg)
+                    return {"status": True, "message": msg}
+
+                print(f"Database '{database_name}' still active. Checking again in {poll_interval}s...")
+
+            except Exception as e:
+                print(f"Error while checking relic status: {e}")
+
+            # Timeout condition
+            elapsed = time.time() - start_time
+            if elapsed >= timeout:
+                msg = f"Timed out after {timeout}s — database '{database_name}' did not become a relic."
+                print(msg)
+                return {"status": False, "message": msg}
+
+            time.sleep(poll_interval)
+
+
+ 

@@ -1,0 +1,430 @@
+class OracleConnection:
+
+    def __init__(self):
+        self.current_working_directory = os.getcwd()
+        # print(self.current_working_directory)
+        self.config_file_path = os.path.join(self.current_working_directory, r"config")
+        # print(self.config_file_path)
+        self.config = configparser.ConfigParser()
+        # self.config_file_path = r"C:\Users\RRana24\JnJ\OralceandPostgres\ORACLE\ORACLE\JFMN-72-Oracle\config"
+        self.config.read(os.path.join(self.config_file_path, "main_config.ini"))
+        self.username = self.config["oracle_connection_details"]["username"]
+        print(f"Username:{self.username}")
+        self.password = Utility.decode(self.config["oracle_connection_details"]["password"])
+        # self.password = self.config["oracle_connection_details"]["password"]
+        print(f"Password:{self.password}")
+        # self.host = self.config["oracle_connection_details"]["host"]
+        self.port = self.config["oracle_connection_details"]["port"]
+        self.service = self.config["oracle_connection_details"]["service"]
+        print(f"Service:{self.service}")
+        # self.schema = self.config["oracle_connection_details"]["schema"]
+        # self.table = self.config["oracle_connection_details"]["table"]
+        # self.pdb_username = self.config["oracle_connection_details"]["pdb_username"]
+        # self.pdb_service = self.config["oracle_connection_details"]["pdb_service"]
+
+    def connect(self, server_ip):
+        dsn = f"{server_ip}:{self.port}/{self.service}"
+        try:
+            print(f"Attempting to connect to Oracle DB at {server_ip}")
+            print(f"Username:{self.username}\nDSN:{dsn}\nPassword:{self.password}")
+            connection = oracledb.connect(
+                user=self.username,
+                password=self.password,
+                dsn=dsn,
+                mode=oracledb.SYSDBA
+            )
+            print(f"Successfully connected to Oracle DB at {server_ip}")
+            return connection
+        except oracledb.Error as error:
+            msg = f"Error connecting to Oracle DB {server_ip}\n{str(error)}"
+            raise oracledb.Error(msg)
+
+    def connect_to_user(self, server_ip, user, password):
+        user_dsn = f"{server_ip}:{self.port}/{self.service}"
+        try:
+            print(f"Attempting to connect to Oracle DB at {server_ip} at user {user}")
+            connection = oracledb.connect(
+                user=user,
+                password=password,
+                dsn=user_dsn,
+                # mode=oracledb.SYSDBA
+            )
+            print(f"Successfully connected to Oracle DB at {server_ip}")
+            return connection
+
+        except oracledb.Error as error:
+            msg = f"Error connecting to Oracle DB {server_ip}\n{str(error)}"
+            raise oracledb.Error(msg)
+
+    def grant_privileges(self, connection, user):
+        """
+        Grants necessary privileges to the specified user.
+        """
+
+        try:
+            with connection.cursor() as cursor:
+                print(f"Granting privileges to user '{user}'...")
+                # cursor.execute(f"ALTER SESSION SET CONTAINER = {database_name}")
+                # cursor.execute(f"GRANT CREATE SESSION TO {user}")
+                # cursor.execute(f"GRANT CREATE TABLE TO {user}")
+                cursor.execute(f"GRANT CREATE SESSION TO {user}")
+                cursor.execute(f"GRANT CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE PROCEDURE TO {user}")
+                print(f"Privileges granted to '{user}'.")
+                connection.commit()
+        except oracledb.Error as e:
+            print(f"Error granting privileges: {e}")
+            connection.rollback()
+
+    def create_pdb(self, server_ip, pdb_name):
+        connection = None
+        cursor = None
+        try:
+            # Connect to the PDB directly
+            connection = self.connect(server_ip)
+            print(f"Connected to PDB: {connection.dsn}")
+            cursor = connection.cursor()
+
+            # Step 1: Create the PDB (without FILE_NAME_CONVERT)
+            cursor.execute(f"""
+                    CREATE PLUGGABLE DATABASE {pdb_name}
+                    ADMIN USER "{self.pdb_username}" IDENTIFIED BY "{self.password}"
+                """)
+            print(f"PDB {pdb_name} created successfully.")
+
+            # Step 2: Open the PDB
+            cursor.execute(f"ALTER PLUGGABLE DATABASE {pdb_name} OPEN")
+            print(f"PDB {pdb_name} opened successfully.")
+
+            # Step 3: Save state
+            cursor.execute(f"ALTER PLUGGABLE DATABASE {pdb_name} SAVE STATE")
+            print("pdb in open state saved")
+
+            return f"PDB {pdb_name} created and opened successfully."
+
+        except Exception as e:
+            raise Exception(f"Failed to create/open PDB: {str(e)}")
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def create_table(self, server_ip, user, password, table_name):
+        cursor = None
+        connection = None
+        try:
+            connection = self.connect(server_ip)
+            self.grant_privileges(connection, user)
+            connection.close()
+            connection = self.connect_to_user(server_ip,user,password)
+            cursor = connection.cursor()
+            # Check if table exists
+            cursor.execute(f"""
+                    SELECT COUNT(*) FROM all_tables
+                    WHERE table_name = UPPER('{table_name}')
+                            """)
+            exists = cursor.fetchone()[0] > 0
+            if exists:
+                return f"Table {table_name} already exists"
+
+            # Create table with correct columns
+            cursor.execute(f"""
+                    CREATE TABLE {table_name} (
+                        BAKCUPID NUMBER PRIMARY KEY,
+                        NAME VARCHAR2(100)
+        
+                    )
+                """)
+            connection.commit()
+            return f"Table {table_name} created"
+        except Exception as error:
+            msg = f"Failed to create table {table_name}.\nError :- {str(error)}"
+            raise Exception(msg)
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def insert(self, server_ip,user, password, table_name):
+        cursor = None
+        connection = None
+        try:
+            # connection = self.connect(server_ip)
+            connection = self.connect_to_user(server_ip,user,password)
+            cursor = connection.cursor()
+            insert_sql = f"""
+                       INSERT INTO {table_name}
+                       (BAKCUPID, NAME)
+                       VALUES (:1, :2)
+                   """
+            values = (1, "John Doe")
+            cursor.execute(insert_sql, values)
+            connection.commit()
+            return f"Successfully inserted data into table {table_name}"
+        except Exception as error:
+            msg = f"Failed to insert into table {table_name}.\nError :- {str(error)}"
+            raise Exception(msg)
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def drop_table(self, server_ip,user,tablename):
+        cursor = None
+        connection = None
+        try:
+            connection = self.connect(server_ip)
+            cursor = connection.cursor()
+            cursor.execute(f"DROP TABLE {user}.{tablename} PURGE")
+            connection.commit()
+            return f"Table {tablename} dropped successfully"
+        except oracledb.DatabaseError as error:
+            if "ORA-00942" in str(error):
+                return f"Table {tablename} does not exist"
+            msg = f"Failed to drop table {tablename}.\nError :- {str(error)}"
+            raise Exception(msg)
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+#including_datafiles=True
+    def drop_pdb(self, server_ip, pdb_name):
+        connection = None
+        cursor = None
+        try:
+            connection = self.connect(server_ip)  # reuse your existing connect() method
+            cursor = connection.cursor()
+            # cursor.execute(f"ALTER SESSION SET CONTAINER = {pdb_name}")
+            cursor.execute(f"ALTER PLUGGABLE DATABASE {pdb_name} CLOSE IMMEDIATE")
+            # Build DROP command
+            drop_cmd = f"DROP PLUGGABLE DATABASE {pdb_name}"
+            # if including_datafiles:
+            drop_cmd += " INCLUDING DATAFILES"
+
+            cursor.execute(drop_cmd)
+            connection.commit()
+            return f"PDB '{pdb_name}' dropped successfully."
+
+        except oracledb.DatabaseError as e:
+            if "ORA-04043" in str(e):
+                return f"PDB '{pdb_name}' does not exist."
+            raise Exception(f"Failed to drop PDB '{pdb_name}': {str(e)}")
+
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def get_table_status(self, server, user, password, table_name):
+        cursor = None
+        connection = None
+        try:
+            # connection = self.connect(server)
+            connection = self.connect_to_user(server,user,password)
+            cursor = connection.cursor()
+
+            query = f"""
+                    SELECT table_name 
+                    FROM all_tables 
+                    WHERE table_name = UPPER(:table_name)   
+                   """
+            # WHERE Table_name = '{table_name}
+            # query = f"SELECT Table_name FROM user_tables ORDERED BY Table_name"
+            cursor.execute(query, {"table_name":table_name})
+            rows = cursor.fetchall()
+            # print(f"List of Tables:{rows}")
+            exists = len(rows)>0
+
+            return f"Table {table_name} exists" if exists else f"Table {table_name} does not exist"
+
+        except Exception as error:
+            msg = f"Failed to check table {table_name}.\nError :- {str(error)}"
+            raise Exception(msg)
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def get_table_data(self, server,user, password, table_name):
+        cursor = None
+        connection = None
+        try:
+            # connection = self.connect(server)
+            connection = self.connect_to_user(server,user, password)
+            cursor = connection.cursor()
+            # cursor.execute(f"ALTER SESSION SET CONTAINER = {user}")
+            query = f"""
+                    SELECT * from {table_name}     
+                   """
+            print(query)
+            cursor.execute(query)
+            data = cursor.fetchall()
+
+            return data
+
+        except Exception as error:
+            msg = f"Error querying the table {table_name}.\nError :- {str(error)}"
+            raise Exception(msg)
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def verify_container_database_dropped(self, server: str) -> str:
+
+        connection = None
+
+        try:
+            # Attempt to connect using existing connection method
+            connection = self.connect(server)
+
+            # If connection succeeds, the database is still up
+            return f"Database still exists and connection succeeded."
+
+        except Exception as e:
+            error_msg = str(e)
+            # Common Oracle errors that indicate database is dropped or unavailable
+            known_drop_errors = [
+                "ORA-01034",  # ORACLE not available
+                "ORA-27101",  # shared memory realm does not exist
+                "ORA-12514",  # listener does not currently know of service requested
+                "ORA-12541",  # no listener
+                "ORA-12505",  # listener does not currently know of SID
+            ]
+
+            if any(err in error_msg for err in known_drop_errors):
+                return f"Database has been dropped or is unavailable: {error_msg}"
+            else:
+                return f"Unexpected error while verifying '{server}': {error_msg}"
+
+        finally:
+            if connection:
+                connection.close()
+
+    def get_database(self, server, user, password):
+        cursor = None
+        connection = None
+        try:
+            connection = self.connect_to_user(server, user, password)
+            cursor = connection.cursor()
+
+        except:
+            msg = f"Database {user} does not exist"
+            return msg
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def get_container_database(self,server,user, password):
+        cursor = None
+        connection = None
+        try:
+            connection = self.connect_to_user(server,user,password)
+            cursor = connection.cursor()
+
+        except:
+            msg = f"Database {user} does not exist"
+            return msg
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def execute_query(self, server_ip, query, params=None):
+        cursor = None
+        connection = None
+        try:
+            connection = self.connect(server_ip)
+            cursor = connection.cursor()
+            cursor.execute(query, params)
+            connection.commit()
+            return cursor.fetchall()
+        except Exception as e:
+            print(f"Error executing query: {e}")
+            return None
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+    def delete_archive_logs(self, server_ip, log_file):
+        try:
+            query = f"ALTER SYSTEM ARCHIVE LOG DELETE '{log_file}'"
+            self.execute_query(server_ip, query)
+            return "archive logs deleted"
+        except Exception as e:
+            return f"FAILURE: {str(e)}"
+
+    def check_archive_log_status(self, server_ip, log_file):
+        try:
+            query = "SELECT NAME FROM V$archived_log"
+            logs = self.execute_query(server_ip, query)
+            existing_logs = [row[0] for row in logs] if logs else []
+
+            if log_file not in existing_logs:
+                return f"Archive log does not exist"
+            else:
+                return f"Archive log exists"
+
+        except Exception as e:
+            return f"Error checking archive log '{log_file}': {str(e)}"
+
+
+    def create_schema(self, server_ip, username, password):
+        connection = None
+        cursor = None
+        try:
+
+            connection = self.connect(server_ip)
+            print(f"Connected to: {connection.dsn}")
+            cursor = connection.cursor()
+            check_query ="""SELECT COUNT(*) FROM all_users WHERE username = UPPER(:username)"""
+            cursor.execute(check_query,{"username":username})
+            exists = cursor.fetchone()[0]
+            if exists:
+                return f"Schema/User {username} already exists"
+
+            cursor.execute(f"""
+                   CREATE USER {username} IDENTIFIED BY {password}
+                   DEFAULT TABLESPACE users
+                   TEMPORARY TABLESPACE temp
+                   QUOTA UNLIMITED ON users
+                """)
+            # print(f"Schema {username} created successfully.")
+
+            return f"Schema {username} created successfully."
+
+        except Exception as e:
+            raise Exception(f"Failed to create schema: {str(e)}")
+        finally:
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
+
+
+
+
+# Step1: Create a schema
+# CREATE USER {schema_name} IDENTIFIED BY {schema_password};
+# ////
+# CREATE USER your_schema_name IDENTIFIED BY your_schema_password
+#     DEFAULT TABLESPACE users
+#     TEMPORARY TABLESPACE temp
+#     QUOTA UNLIMITED ON users;
+
+#
+# Step2: Grant priveleges
+# GRANT CREATE SESSION TO your_schema_name;
+# GRANT CREATE TABLE, CREATE VIEW, CREATE SEQUENCE, CREATE PROCEDURE TO your_schema_name;
